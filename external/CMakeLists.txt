@@ -110,55 +110,216 @@ if(SGL_LOCAL_SLANG)
     set(SLANG_INCLUDE_DIR ${SGL_LOCAL_SLANG_DIR}/include)
 endif()
 
-if(SGL_WINDOWS)
-    add_library(slang SHARED IMPORTED GLOBAL)
-    set_target_properties(slang PROPERTIES
-        INTERFACE_INCLUDE_DIRECTORIES ${SLANG_INCLUDE_DIR}
-        IMPORTED_IMPLIB ${SLANG_DIR}/lib/slang.lib
-        IMPORTED_LOCATION ${SLANG_DIR}/bin/slang.dll
-    )
-    sgl_copy_binary(${SLANG_DIR}/bin/slang.dll .)
-    sgl_copy_binary(${SLANG_DIR}/bin/slang-glslang.dll .)
-    sgl_copy_binary(${SLANG_DIR}/bin/slang-glsl-module.dll .)
-    sgl_copy_binary(${SLANG_DIR}/bin/slang-llvm.dll .)
-    sgl_copy_binary(${SLANG_DIR}/bin/slang-rt.dll .)
-elseif(SGL_LINUX)
-    add_library(slang SHARED IMPORTED GLOBAL)
-    set_target_properties(slang PROPERTIES
-        INTERFACE_INCLUDE_DIRECTORIES ${SLANG_INCLUDE_DIR}
-        IMPORTED_LOCATION ${SLANG_DIR}/lib/libslang.so
-    )
-    sgl_copy_binary(${SLANG_DIR}/lib/libslang.so .)
-    sgl_copy_binary(${SLANG_DIR}/lib/libslang-glslang.so .)
-    sgl_copy_binary(${SLANG_DIR}/lib/libslang-glsl-module.so .)
-    # sgl_copy_binary(${SLANG_DIR}/lib/libslang-llvm.so .)
-    sgl_copy_binary(${SLANG_DIR}/lib/libslang-rt.so .)
-elseif(SGL_MACOS)
-    add_library(slang SHARED IMPORTED GLOBAL)
-    set_target_properties(slang PROPERTIES
-        INTERFACE_INCLUDE_DIRECTORIES ${SLANG_INCLUDE_DIR}
-        IMPORTED_LOCATION ${SLANG_DIR}/lib/libslang.dylib
-    )
-    sgl_copy_binary(${SLANG_DIR}/lib/libslang.dylib .)
-    sgl_copy_binary(${SLANG_DIR}/lib/libslang-glslang.dylib .)
-    sgl_copy_binary(${SLANG_DIR}/lib/libslang-glsl-module.dylib .)
-    # sgl_copy_binary(${SLANG_DIR}/lib/libslang-llvm.dylib .)
-    sgl_copy_binary(${SLANG_DIR}/lib/libslang-rt.dylib .)
-endif()
-
+# Download debug info package if needed
 if(NOT SGL_LOCAL_SLANG AND SGL_SLANG_DEBUG_INFO)
     sgl_download_package(slang_debug_info ${SLANG_DEBUG_INFO_URL})
-    if(SGL_WINDOWS)
-        # Note: The downloaded archive has single top-level 'bin' folder that is stripped out by FetchContent.
-        sgl_copy_binary(${slang_debug_info_SOURCE_DIR}/slang.pdb .)
-        sgl_copy_binary(${slang_debug_info_SOURCE_DIR}/slang-rt.pdb .)
-    elseif(SGL_LINUX)
-        sgl_copy_binary(${slang_debug_info_SOURCE_DIR}/lib/libslang.so.dwarf .)
-        sgl_copy_binary(${slang_debug_info_SOURCE_DIR}/lib/libslang-rt.so.dwarf .)
-    elseif(SGL_MACOS)
-        sgl_copy_binary(${slang_debug_info_SOURCE_DIR}/lib/libslang.dylib.dwarf .)
-        sgl_copy_binary(${slang_debug_info_SOURCE_DIR}/lib/libslang-rt.dylib.dwarf .)
+endif()
+
+# Detect whether we have new (renamed) slang or old slang
+# Check for slang-compiler existence to determine this
+if(SGL_WINDOWS)
+    if(EXISTS "${SLANG_DIR}/bin/slang-compiler.dll")
+        set(SLANG_USE_NEW_NAMES ON)
+    else()
+        set(SLANG_USE_NEW_NAMES OFF)
     endif()
+elseif(SGL_MACOS)
+    # Check for either versioned or unversioned slang-compiler
+    if(EXISTS "${SLANG_DIR}/lib/libslang-compiler.dylib")
+        set(SLANG_USE_NEW_NAMES ON)
+    else()
+        set(SLANG_USE_NEW_NAMES OFF)
+    endif()
+else() # Linux
+    # Check for either versioned or unversioned slang-compiler
+    if(EXISTS "${SLANG_DIR}/lib/libslang-compiler.so")
+        set(SLANG_USE_NEW_NAMES ON)
+    else()
+        set(SLANG_USE_NEW_NAMES OFF)
+    endif()
+endif()
+
+if(SLANG_USE_NEW_NAMES)
+    message(STATUS "Detected slang with new naming scheme (libslang-compiler)")
+else()
+    message(STATUS "Detected slang with old naming scheme (libslang)")
+endif()
+
+# Helper function to copy a file while preserving symlinks
+function(sgl_copy_file_preserve_symlink src dst_dir)
+    get_filename_component(filename ${src} NAME)
+    set(dst ${SGL_OUTPUT_DIRECTORY}/${dst_dir}/${filename})
+
+    # Add custom command that preserves symlinks
+    if(IS_SYMLINK ${src})
+        file(READ_SYMLINK ${src} link_target)
+        add_custom_command(
+            OUTPUT ${dst}
+            DEPENDS ${src}
+            COMMAND ${CMAKE_COMMAND} -E create_symlink ${link_target} ${dst}
+            COMMENT "Creating symlink ${filename} -> ${link_target}"
+        )
+        set_property(GLOBAL APPEND PROPERTY SGL_BINARY_FILES_DST ${dst})
+
+        # For install, we need to handle symlinks specially
+        cmake_path(SET install_dir NORMALIZE "${CMAKE_INSTALL_BINDIR}/${dst_dir}")
+        install(CODE "
+            execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink
+                \"${link_target}\"
+                \"\${CMAKE_INSTALL_PREFIX}/${install_dir}/${filename}\")
+        ")
+    else()
+        # Regular file, use normal copy
+        sgl_copy_binary(${src} ${dst_dir})
+    endif()
+endfunction()
+
+# Helper macro to copy a slang library and optionally its debug info
+# lib_name_base: Base name like "slang-compiler", "slang-glslang", etc.
+# lib_type: Either "LINKABLE" (for libraries that can be linked) or "MODULE" (for runtime modules)
+#           or "UNVERSIONED" (for libraries with no version like llvm)
+# Third parameter (optional): HAS_DEBUG_INFO to also copy debug info for this library
+macro(sgl_copy_slang_library lib_name_base lib_type)
+    # Handle optional third parameter
+    set(copy_debug_info OFF)
+    if(${ARGC} GREATER 2)
+        if(${ARGV2} STREQUAL "HAS_DEBUG_INFO")
+            set(copy_debug_info ON)
+        endif()
+    endif()
+
+    # Validate lib_type
+    if(NOT (lib_type STREQUAL "LINKABLE" OR lib_type STREQUAL "MODULE" OR lib_type STREQUAL "UNVERSIONED"))
+        message(FATAL_ERROR "sgl_copy_slang_library: Invalid lib_type '${lib_type}'. Must be LINKABLE, MODULE, or UNVERSIONED")
+    endif()
+
+    # Build library suffix including extension, separator, and version
+    if(SGL_WINDOWS)
+        set(lib_dir "${SLANG_DIR}/bin")
+        set(lib_suffix ".dll")
+        set(debug_dir "${slang_debug_info_SOURCE_DIR}")
+    elseif(SGL_MACOS)
+        set(lib_dir "${SLANG_DIR}/lib")
+        set(debug_dir "${slang_debug_info_SOURCE_DIR}/lib")
+        if(SLANG_USE_NEW_NAMES)
+            if(lib_type STREQUAL "LINKABLE")
+                set(lib_suffix ".0.${SLANG_VERSION}.dylib")
+            elseif(lib_type STREQUAL "MODULE")
+                set(lib_suffix "-${SLANG_VERSION}.dylib")
+            else()
+                # Unversioned
+                set(lib_suffix ".dylib")
+            endif()
+        else()
+            # Old naming
+            set(lib_suffix ".dylib")
+        endif()
+    else() # Linux
+        set(lib_dir "${SLANG_DIR}/lib")
+        set(debug_dir "${slang_debug_info_SOURCE_DIR}/lib")
+        if(SLANG_USE_NEW_NAMES)
+            if(lib_type STREQUAL "LINKABLE")
+                set(lib_suffix ".so.0.${SLANG_VERSION}")
+            elseif(lib_type STREQUAL "MODULE")
+                set(lib_suffix "-${SLANG_VERSION}.so")
+            else()
+                # Unversioned
+                set(lib_suffix ".so")
+            endif()
+        else()
+            # Old naming
+            set(lib_suffix ".so")
+        endif()
+    endif()
+
+    # Find and copy all matching library files (preserving symlinks)
+    if(SGL_WINDOWS)
+        set(lib_pattern "${lib_dir}/${lib_name_base}${lib_suffix}")
+    else()
+        set(lib_pattern "${lib_dir}/lib${lib_name_base}*${lib_suffix}*")
+    endif()
+
+    file(GLOB lib_files "${lib_pattern}")
+    if(lib_files)
+        foreach(lib_file ${lib_files})
+            # Skip debug info files (they'll be copied separately if requested)
+            if(NOT lib_file MATCHES "\\.dwarf$")
+                sgl_copy_file_preserve_symlink("${lib_file}" .)
+            endif()
+        endforeach()
+    else()
+        message(WARNING "Could not find ${lib_name_base} library matching ${lib_pattern}")
+    endif()
+
+    # Copy debug info if requested and available
+    if(copy_debug_info AND NOT SGL_LOCAL_SLANG AND SGL_SLANG_DEBUG_INFO)
+        if(SGL_WINDOWS)
+            set(debug_pattern "${debug_dir}/${lib_name_base}.pdb")
+        else()
+            set(debug_pattern "${debug_dir}/lib${lib_name_base}*${lib_suffix}.dwarf")
+        endif()
+
+        file(GLOB debug_files "${debug_pattern}")
+        if(debug_files)
+            foreach(debug_file ${debug_files})
+                sgl_copy_file_preserve_symlink("${debug_file}" .)
+            endforeach()
+        else()
+            message(WARNING "Could not find ${lib_name_base} debug info matching ${debug_pattern}")
+        endif()
+    endif()
+endmacro()
+
+add_library(slang SHARED IMPORTED GLOBAL)
+
+if(SGL_WINDOWS)
+    # Windows: Link to slang-compiler.lib/dll or slang.lib/dll based on detection
+    if(SLANG_USE_NEW_NAMES)
+        set(SLANG_IMPLIB "${SLANG_DIR}/lib/slang-compiler.lib")
+        set(SLANG_DLL "${SLANG_DIR}/bin/slang-compiler.dll")
+    else()
+        set(SLANG_IMPLIB "${SLANG_DIR}/lib/slang.lib")
+        set(SLANG_DLL "${SLANG_DIR}/bin/slang.dll")
+    endif()
+    set_target_properties(slang PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES ${SLANG_INCLUDE_DIR}
+        IMPORTED_IMPLIB ${SLANG_IMPLIB}
+        IMPORTED_LOCATION ${SLANG_DLL}
+    )
+elseif(SGL_LINUX)
+    # Linux: Use detected naming scheme
+    # Note: If a symlink exists, it will resolve to the versioned file
+    if(SLANG_USE_NEW_NAMES)
+        set(SLANG_LIB "${SLANG_DIR}/lib/libslang-compiler.so")
+    else()
+        set(SLANG_LIB "${SLANG_DIR}/lib/libslang.so")
+    endif()
+    set_target_properties(slang PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES ${SLANG_INCLUDE_DIR}
+        IMPORTED_LOCATION ${SLANG_LIB}
+    )
+elseif(SGL_MACOS)
+    # macOS: Use detected naming scheme
+    # Note: If a symlink exists, it will resolve to the versioned file
+    if(SLANG_USE_NEW_NAMES)
+        set(SLANG_LIB "${SLANG_DIR}/lib/libslang-compiler.dylib")
+    else()
+        set(SLANG_LIB "${SLANG_DIR}/lib/libslang.dylib")
+    endif()
+    set_target_properties(slang PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES ${SLANG_INCLUDE_DIR}
+        IMPORTED_LOCATION ${SLANG_LIB}
+    )
+endif()
+
+# Copy slang libraries and optionally their debug info (platform-agnostic)
+sgl_copy_slang_library("slang-compiler" LINKABLE HAS_DEBUG_INFO)
+sgl_copy_slang_library("slang-glslang" MODULE HAS_DEBUG_INFO)
+sgl_copy_slang_library("slang-glsl-module" MODULE HAS_DEBUG_INFO)
+sgl_copy_slang_library("slang-rt" LINKABLE HAS_DEBUG_INFO)
+# slang-llvm is only distributed on Windows (no debug info available)
+if(SGL_WINDOWS)
+    sgl_copy_slang_library("slang-llvm" UNVERSIONED)
 endif()
 
 # Install slang header files
