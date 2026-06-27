@@ -1,0 +1,25 @@
+name: PR Review Fork Apply
+
+# Stage 2 of the fork-review relay for the PR board sync. Triggered by the
+# completion of "PR Review Fork Bridge" (pr-review-fork-bridge.yml).
+#
+# A workflow_run workflow runs in the base repo's PRIVILEGED context with secrets
+# even when the upstream run was a fork PR's review -- the only way to update the
+# board for fork-PR reviews on a public repo. The reusable workflow's workflow_run
+# dispatch branch resolves the PR from the upstream run's head SHA and reconciles.
+# It does NO checkout (metadata only), so this privileged context is not a
+# pwn-request vector.
+#
+# (workflow_run only fires for workflow files on the default branch.)
+
+on:
+  workflow_run:
+    workflows: ["PR Review Fork Bridge"]
+    types: [completed]
+
+jobs:
+  board-sync:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    uses: shader-slang/slang/.github/workflows/pr-board-sync.yml@master
+    secrets:
+      SLANG_PR_BOT_TOKEN: ${{ secrets.SLANG_PR_BOT_TOKEN }}
